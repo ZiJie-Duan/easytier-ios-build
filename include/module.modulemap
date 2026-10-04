@@ -1,0 +1,4 @@
+module EasyTierFFI {
+  header "easytier_ffi.h"
+  export *
+}

@@ -1,0 +1,62 @@
+name: build-ios
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      easytier_ref:
+        description: EasyTier tag or branch
+        default: v2.6.4
+      features:
+        description: easytier cargo features (comma separated)
+        default: smoltcp,socks5,kcp,zstd
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      EASYTIER_REF: ${{ inputs.easytier_ref || 'v2.6.4' }}
+      FEATURES: ${{ inputs.features || 'smoltcp,socks5,kcp,zstd' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone EasyTier
+        run: git clone --depth 1 --branch "$EASYTIER_REF" https://github.com/EasyTier/EasyTier.git build/EasyTier
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: build/EasyTier -> target
+          key: ${{ env.EASYTIER_REF }}-${{ env.FEATURES }}
+
+      - name: Build xcframework
+        run: ./scripts/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EasyTierFFI-${{ env.EASYTIER_REF }}
+          path: |
+            dist/EasyTierFFI.xcframework.zip
+            dist/EasyTierFFI.xcframework.zip.sha256
+            dist/BUILD_INFO.txt
+            build/logs/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: dist/BUILD_INFO.txt
+          files: |
+            dist/EasyTierFFI.xcframework.zip
+            dist/EasyTierFFI.xcframework.zip.sha256
