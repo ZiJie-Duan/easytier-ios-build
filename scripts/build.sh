@@ -73,9 +73,11 @@ for target in $TARGETS; do
   [[ -f $lib ]] || { echo "missing $lib"; exit 1; }
 
   log "Checking exported symbols in $target"
+  # Dump to a file first: `nm | grep -q` under pipefail fails via SIGPIPE.
+  nm -gU "$lib" 2>/dev/null > "$LOGS/$target.symbols.txt" || true
   for sym in parse_config run_network_instance retain_network_instance \
              collect_network_infos set_tun_fd get_error_msg free_string; do
-    nm -gU "$lib" 2>/dev/null | grep -q " _${sym}$" || { echo "symbol $sym not exported"; exit 1; }
+    grep -E " T _${sym}$" "$LOGS/$target.symbols.txt" || { echo "symbol $sym not exported"; exit 1; }
   done
   echo "all 7 symbols present"
 
