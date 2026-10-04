@@ -1,0 +1,98 @@
+name: smoke-ios-sim
+
+# Runs the published EasyTierFFI.xcframework inside an iOS Simulator the way the
+# Trinity app uses it (see smoke/main.swift and the README's "Simulator smoke test").
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to test
+        default: v2.6.4-1
+      sha256:
+        description: Expected sha256 of EasyTierFFI.xcframework.zip
+        default: 0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090
+  push:
+    branches: [main]
+    paths:
+      - 'smoke/**'
+      - '.github/workflows/smoke-ios-sim.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || 'v2.6.4-1' }}
+      EXPECTED_SHA256: ${{ inputs.sha256 || '0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download and verify xcframework
+        run: |
+          set -euo pipefail
+          mkdir -p build && cd build
+          curl -fsSL -o EasyTierFFI.xcframework.zip \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/EasyTierFFI.xcframework.zip"
+          echo "${EXPECTED_SHA256}  EasyTierFFI.xcframework.zip" | shasum -a 256 -c -
+          unzip -q EasyTierFFI.xcframework.zip
+          find EasyTierFFI.xcframework -maxdepth 3 | sort
+          cat EasyTierFFI.xcframework/ios-arm64-simulator/Headers/module.modulemap
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          xcrun swiftc --version
+
+      - name: Compile smoke binary (import EasyTierFFI via modulemap)
+        run: |
+          set -euo pipefail
+          SIM=build/EasyTierFFI.xcframework/ios-arm64-simulator
+          xcrun --sdk iphonesimulator swiftc \
+            -target arm64-apple-ios15.1-simulator \
+            -O \
+            -I "$SIM/Headers" \
+            -L "$SIM" -leasytier_ffi \
+            -liconv -framework SystemConfiguration -framework CoreFoundation \
+            smoke/main.swift -o build/smoke
+          ls -lh build/smoke
+          file build/smoke
+          otool -l build/smoke | grep -A4 LC_BUILD_VERSION
+          codesign -s - -f build/smoke
+          codesign -dv build/smoke 2>&1 | head -5
+
+      - name: Boot simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          c = [(rt, x) for rt, xs in d.items() if "iOS" in rt for x in xs if x["name"].startswith("iPhone")]
+          c.sort(key=lambda p: p[0])
+          rt, x = c[-1]
+          print(x["udid"])
+          print(rt, x["name"], file=sys.stderr)
+          ')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Run smoke test in simulator
+        run: |
+          set -o pipefail
+          ABS=$PWD
+          perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl spawn "$UDID" "$ABS/build/smoke" "$ABS/smoke/hub.toml" "$ABS/smoke/trinity.toml" 2>&1 | tee build/smoke.log
+          rc=${PIPESTATUS[0]}
+          echo "exit code: $rc"
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-log
+          path: build/smoke.log

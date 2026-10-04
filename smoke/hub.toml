@@ -1,0 +1,16 @@
+# Stand-in for the real server node 10.144.144.50, run in the same process.
+# Same network_identity as trinity.toml; listens where trinity.toml's peer points.
+instance_name = "hub"
+hostname = "hub"
+ipv4 = "10.144.144.50/24"
+dhcp = false
+listeners = ["tcp://127.0.0.1:11010"]
+
+[network_identity]
+network_name = "trinity-smoke"
+network_secret = "smoke-secret"
+
+[flags]
+bind_device = false
+disable_upnp = true
+no_tun = true
