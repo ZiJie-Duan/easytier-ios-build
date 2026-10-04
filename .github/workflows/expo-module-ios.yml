@@ -129,8 +129,7 @@ jobs:
           echo "workspace=$WS scheme=$SCHEME"
           xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath ../build CODE_SIGNING_ALLOWED=NO build > ../xcodebuild.log 2>&1
-          rc=$?
+            -derivedDataPath ../build CODE_SIGNING_ALLOWED=NO build > ../xcodebuild.log 2>&1 && rc=0 || rc=$?
           echo "xcodebuild exit code: $rc"
           echo "--- errors/warnings mentioning EasyTier ---"
           grep -nE "EasyTier.*(error|warning):|(error|warning):.*EasyTier" ../xcodebuild.log | head -50 || true

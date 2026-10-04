@@ -54,6 +54,11 @@ Pod::Spec.new do |s|
     # `import EasyTierFFI` resolve even if the importer does not pick the module map
     # up from HEADER_SEARCH_PATHS on its own.
     xcconfig['SWIFT_INCLUDE_PATHS'] = '$(inherited) "${PODS_XCFRAMEWORKS_BUILD_DIR}/EasyTier/Headers"'
+    # The xcframework has no x86_64 simulator slice. A generic simulator build
+    # (Release, ONLY_ACTIVE_ARCH=NO, e.g. an EAS simulator build) would otherwise also
+    # compile this pod for x86_64 and fail with "no such module 'EasyTierFFI'".
+    xcconfig['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = 'x86_64'
+    s.user_target_xcconfig = { 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'x86_64' }
   else
     Pod::UI.warn "[EasyTier] #{framework_rel_path} not found - building the EasyTier module " \
                  'without the native library (isAvailable() will be false). ' \
