@@ -143,10 +143,12 @@ jobs:
       - name: Tier 1 assertions
         working-directory: ${{ env.APP_DIR }}
         run: |
-          set -euo pipefail
+          set -eu
           # The Swift compile of EasyTierModule.swift must carry -DEASYTIER_FFI_VENDORED.
-          if grep -E "swift-frontend|swiftc|SwiftCompile|SwiftDriver" xcodebuild.log | grep "EasyTier" | grep -q -- "-DEASYTIER_FFI_VENDORED"; then
-            echo "OK: EasyTier Swift compiled with -DEASYTIER_FFI_VENDORED"
+          VEND=$(grep -E "builtin-Swift.*-module-name EasyTier " xcodebuild.log | grep -c -- "-DEASYTIER_FFI_VENDORED" || true)
+          if [ "${VEND:-0}" -gt 0 ]; then
+            echo "OK: $VEND EasyTier Swift compiler invocations carry -DEASYTIER_FFI_VENDORED:"
+            grep -E "builtin-Swift.*-module-name EasyTier " xcodebuild.log | grep -oE -- "-DEASYTIER_FFI_VENDORED|-target [^ ]+" | sort | uniq -c
           else
             echo "::error::no EasyTier swift compile with -DEASYTIER_FFI_VENDORED found"; exit 1
           fi
@@ -154,7 +156,7 @@ jobs:
           if grep -qE "Undefined symbols|duplicate symbol" xcodebuild.log; then
             echo "::error::undefined/duplicate symbols"; exit 1
           fi
-          APP=$(ls -d build/Build/Products/Release-iphonesimulator/*.app | head -1)
+          APP="$PWD/$(ls -d build/Build/Products/Release-iphonesimulator/*.app | head -1)"
           echo "APP=$APP" >> "$GITHUB_ENV"
           BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
           ls -la "$APP" | head -40
