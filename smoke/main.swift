@@ -316,6 +316,9 @@ if let a = appInfo {
   check("c4. trinity running=true, no error_msg", (a["running"] as? Bool) == true && (a["error_msg"] as? String ?? "").isEmpty,
         "running=\(a["running"] ?? "nil") error_msg=\(a["error_msg"] ?? "nil")")
   let ips = routeIps(a)
+  if let route = ((a["peer_route_pairs"] as? [[String: Any]])?.first?["route"] as? [String: Any]) {
+    log("hub route feature_flag.kcp_input=\((route["feature_flag"] as? [String: Any])?["kcp_input"] ?? "nil") (true => port_forward uses the KCP stream proxy)")
+  }
   check("c5. hub \(hubIp) among trinity's routes", connectedAfter >= 0,
         "routes=\(ips) after=\(String(format: "%.1fs", connectedAfter))")
   log("top-level keys (trinity): \(a.keys.sorted())")
@@ -407,6 +410,44 @@ sleepMs(1500)
 check("f5. collect shows restarted trinity", collect()?.keys.contains("trinity") == true)
 let (s2, s2d) = stopAll()
 check("f6. stop again", s2, s2d)
+
+// g. same forward with the hub refusing KCP input: forces the smoltcp TCP path
+// (raw TCP/IP packets over the overlay instead of the KCP stream proxy).
+let hubNoKcp = hubToml.replacingOccurrences(of: "[flags]\n", with: "[flags]\ndisable_kcp_input = true\n")
+let (g1, g1d) = start(hubNoKcp)
+let (g2, g2d) = start(appToml)
+check("g1. restart hub (disable_kcp_input) + trinity", g1 && g2, "\(g1d) / \(g2d)")
+var hubKcpFlag: Any = "unknown"
+let tG = Date()
+while Date().timeIntervalSince(tG) < 20 {
+  if let a = collect()?["trinity"].flatMap(jsonObject),
+     let route = ((a["peer_route_pairs"] as? [[String: Any]]) ?? []).map({ $0["route"] as? [String: Any] ?? [:] })
+       .first(where: { inetString($0["ipv4_addr"])?.hasPrefix(hubIp + "/") == true }) {
+    hubKcpFlag = (route["feature_flag"] as? [String: Any])?["kcp_input"] ?? "missing"
+    if (hubKcpFlag as? Bool) == false { break }
+  }
+  sleepMs(500)
+}
+check("g2. trinity sees hub feature_flag.kcp_input=false", (hubKcpFlag as? Bool) == false, "kcp_input=\(hubKcpFlag)")
+echoLock.lock(); let acceptedBefore = echoAccepted; echoLock.unlock()
+var gFd: Int32 = -1
+let tG2 = Date()
+while Date().timeIntervalSince(tG2) < 10 {
+  gFd = connectLocal(forwardPort)
+  if gFd >= 0 { break }
+  sleepMs(500)
+}
+if gFd >= 0 {
+  let (reply, why) = roundTrip(gFd, "ping-smoltcp\n", timeoutSeconds: 12)
+  close(gFd)
+  echoLock.lock(); let acceptedAfter = echoAccepted; echoLock.unlock()
+  check("g3. round trip via smoltcp TCP path", reply == "ECHO:ping-smoltcp\n",
+        "reply=\(reply.map { $0.debugDescription } ?? "nil") (\(why)); new echo conns=\(acceptedAfter - acceptedBefore)")
+} else {
+  check("g3. round trip via smoltcp TCP path", false, "connect errno=\(-gFd)")
+}
+let (g4, g4d) = stopAll()
+check("g4. stop", g4, g4d)
 log("memory final: \(memory())")
 
 log("== SUMMARY ==")
