@@ -11,7 +11,10 @@ set -euo pipefail
 
 EASYTIER_REF=${EASYTIER_REF:-v2.6.4}
 # no_tun + port_forward needs smoltcp/socks5; kcp and zstd match the server side.
-FEATURES=${FEATURES:-smoltcp,socks5,kcp,zstd}
+# tun + magic-dns are required to compile on iOS: the `mobile` cfg (target_os=ios)
+# code paths (Instance::setup_nic_ctx_for_mobile, launcher run_routine_for_mobile)
+# use NicCtx/create_magic_dns_runner without feature gates. Harmless with no_tun.
+FEATURES=${FEATURES:-tun,magic-dns,smoltcp,socks5,kcp,zstd}
 TARGETS=${TARGETS:-"aarch64-apple-ios aarch64-apple-ios-sim"}
 export IPHONEOS_DEPLOYMENT_TARGET=${IPHONEOS_DEPLOYMENT_TARGET:-15.1}
 

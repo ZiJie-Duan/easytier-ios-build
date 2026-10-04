@@ -12,7 +12,7 @@ on:
         default: v2.6.4
       features:
         description: easytier cargo features (comma separated)
-        default: smoltcp,socks5,kcp,zstd
+        default: tun,magic-dns,smoltcp,socks5,kcp,zstd
 
 permissions:
   contents: write
@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 120
     env:
       EASYTIER_REF: ${{ inputs.easytier_ref || 'v2.6.4' }}
-      FEATURES: ${{ inputs.features || 'smoltcp,socks5,kcp,zstd' }}
+      FEATURES: ${{ inputs.features || 'tun,magic-dns,smoltcp,socks5,kcp,zstd' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -35,10 +35,13 @@ jobs:
       - name: Clone EasyTier
         run: git clone --depth 1 --branch "$EASYTIER_REF" https://github.com/EasyTier/EasyTier.git build/EasyTier
 
+      - name: Compute cache key
+        run: echo "CACHE_KEY=${EASYTIER_REF}-$(echo "$FEATURES" | tr ',' '_')" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: build/EasyTier -> target
-          key: ${{ env.EASYTIER_REF }}-${{ env.FEATURES }}
+          key: ${{ env.CACHE_KEY }}
 
       - name: Build xcframework
         run: ./scripts/build.sh
