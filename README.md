@@ -31,6 +31,12 @@ EASYTIER_REF=v2.6.4 FEATURES=tun,magic-dns,smoltcp,socks5,kcp,zstd ./scripts/bui
 
 Results for EasyTier `v2.6.4` (commit `8428a89`), rustc 1.95.0, `IPHONEOS_DEPLOYMENT_TARGET=15.1`, runner `macos-15`.
 
+### Release
+
+- Release page: https://github.com/ZiJie-Duan/easytier-ios-build/releases/tag/v2.6.4-1
+- Download: https://github.com/ZiJie-Duan/easytier-ios-build/releases/download/v2.6.4-1/EasyTierFFI.xcframework.zip
+- sha256: `0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090`
+
 ### Problems hit and fixes
 
 1. **rust-cache `key` invalid** — the key was `${EASYTIER_REF}-${FEATURES}` and contained commas. Fix: a workflow step computes `CACHE_KEY` with commas replaced by `_`.
