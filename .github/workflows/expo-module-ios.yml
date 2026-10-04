@@ -214,16 +214,20 @@ jobs:
           python3 expo-module/harness/server.py "$OUT/result.json" > "$OUT/server.log" 2>&1 &
           xcrun simctl spawn "$UDID" log stream --style compact \
             --predicate 'eventMessage CONTAINS "EASYTIER" OR process == "e2e"' > "$OUT/app-log.txt" 2>&1 &
-          perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl spawn "$UDID" "$ABS/build/smoke" --hub-only "$ABS/smoke/hub.toml" 240 > "$OUT/hub.log" 2>&1 &
+          date; xcrun simctl install "$UDID" "$APP" || { codesign -s - -f --deep "$APP" && xcrun simctl install "$UDID" "$APP"; }
+          date
+          # Start the hub only now (install can take minutes on a fresh simulator).
+          perl -e 'alarm shift; exec @ARGV' 600 xcrun simctl spawn "$UDID" "$ABS/build/smoke" --hub-only "$ABS/smoke/hub.toml" 420 > "$OUT/hub.log" 2>&1 &
+          HUB_PID=$!
           sleep 5
           cat "$OUT/hub.log"
-          xcrun simctl install "$UDID" "$APP" || { codesign -s - -f --deep "$APP" && xcrun simctl install "$UDID" "$APP"; }
-          xcrun simctl launch "$UDID" "$BUNDLE_ID"
-          for i in $(seq 1 150); do
+          date; xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          for i in $(seq 1 300); do
             [ -s "$OUT/result.json" ] && break
             sleep 1
           done
           xcrun simctl io "$UDID" screenshot "$OUT/screen.png" || true
+          date; kill "$HUB_PID" 2>/dev/null || true; sleep 1
           echo "--- hub.log ---"; cat "$OUT/hub.log"
           echo "--- server.log ---"; cat "$OUT/server.log"
           echo "--- app log (EASYTIER lines) ---"; grep "EASYTIER" "$OUT/app-log.txt" | tail -40 || true
