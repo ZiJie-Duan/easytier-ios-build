@@ -1,0 +1,7 @@
+{
+  "_comment": "Pinned EasyTierFFI.xcframework release consumed by scripts/fetch-xcframework.js. Built by https://github.com/ZiJie-Duan/easytier-ios-build (tag v*). '{tag}' in url is replaced with tag. Set sha256 to the value of EasyTierFFI.xcframework.zip.sha256 from that release.",
+  "tag": "v2.6.4-1",
+  "easytierVersion": "2.6.4",
+  "url": "https://github.com/ZiJie-Duan/easytier-ios-build/releases/download/{tag}/EasyTierFFI.xcframework.zip",
+  "sha256": "0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090"
+}

@@ -251,6 +251,37 @@ func sleepMs(_ ms: Int) { usleep(useconds_t(ms * 1000)) }
 // MARK: - Main
 
 let args = CommandLine.arguments
+
+// Hub-only mode for the Expo module e2e test (.github/workflows/expo-module-ios.yml):
+//   smoke --hub-only <hub.toml> <seconds>
+// Runs just the "hub" instance (no echo server; the workflow serves 127.0.0.1:8080
+// itself) and logs which peers it sees until <seconds> have passed.
+if args.count >= 3, args[1] == "--hub-only" {
+  guard let toml = try? String(contentsOfFile: args[2], encoding: .utf8) else {
+    log("hub-only: cannot read \(args[2])")
+    exit(2)
+  }
+  let seconds = args.count >= 4 ? (Double(args[3]) ?? 120) : 120
+  let (ok, detail) = start(toml)
+  log("hub-only: run_network_instance(hub) \(ok ? "ok" : "FAILED") \(detail)")
+  if !ok { exit(1) }
+  let tH = Date()
+  var lastRoutes: [String] = []
+  while Date().timeIntervalSince(tH) < seconds {
+    if let hub = collect()?["hub"].flatMap(jsonObject) {
+      let ips = routeIps(hub)
+      if ips != lastRoutes {
+        log("hub-only: t=\(String(format: "%.1f", Date().timeIntervalSince(tH)))s routes=\(ips)")
+        lastRoutes = ips
+      }
+    }
+    sleepMs(1000)
+  }
+  let (sOk, sDetail) = stopAll()
+  log("hub-only: stop \(sOk ? "ok" : "FAILED") \(sDetail); final routes=\(lastRoutes)")
+  exit(0)
+}
+
 guard args.count >= 3,
       let hubToml = try? String(contentsOfFile: args[1], encoding: .utf8),
       let appToml = try? String(contentsOfFile: args[2], encoding: .utf8) else {

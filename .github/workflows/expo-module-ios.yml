@@ -1,0 +1,248 @@
+name: expo-module-ios
+
+# Builds the EasyTier local Expo module (expo-module/easytier) inside a freshly
+# scaffolded Expo SDK 57 app and runs it in the iOS Simulator. See the README's
+# "Expo module CI" section.
+#
+# Tier 1: create-expo-app (SDK 57) + module + fetch-xcframework.js + prebuild +
+#         pod install + Release simulator xcodebuild; asserts that the real FFI path
+#         (EASYTIER_FFI_VENDORED) is compiled and that the app links.
+# Tier 2: runs the Release .app next to an EasyTier "hub" (smoke --hub-only) and checks
+#         that JS sees the hub as a peer and that fetch() works through a port forward.
+#
+# macos-26 because Expo SDK 57 requires Xcode 26.4+ (macos-15 tops out at 26.3).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'expo-module/**'
+      - 'smoke/**'
+      - '.github/workflows/expo-module-ios.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  expo-module:
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      APP_DIR: ${{ github.workspace }}/e2e-work/e2e
+      BUNDLE_ID: com.example.easytiersmoke
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          node --version; npm --version; pod --version
+
+      # ---------------- Tier 1 ----------------
+
+      - name: Scaffold Expo SDK 57 app
+        run: |
+          set -euo pipefail
+          mkdir -p e2e-work && cd e2e-work
+          npx --yes create-expo-app@latest e2e --template blank-typescript@sdk-57
+          cd e2e
+          node -e "console.log('expo', require('expo/package.json').version, 'react-native', require('react-native/package.json').version)"
+          cat app.json
+
+      - name: Add EasyTier module + harness
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p modules
+          cp -R "$GITHUB_WORKSPACE/expo-module/easytier" modules/easytier
+          cp "$GITHUB_WORKSPACE/expo-module/harness/App.tsx" App.tsx
+          node -e '
+            const fs = require("fs");
+            const j = JSON.parse(fs.readFileSync("app.json", "utf8"));
+            j.expo.name = "e2e";
+            j.expo.ios = Object.assign({}, j.expo.ios, {
+              bundleIdentifier: process.env.BUNDLE_ID,
+              // same ATS setting as the real app
+              infoPlist: { NSAppTransportSecurity: { NSAllowsLocalNetworking: true } },
+            });
+            fs.writeFileSync("app.json", JSON.stringify(j, null, 2));
+          '
+          cat app.json
+          npx tsc --noEmit
+
+      - name: Fetch xcframework (module script, strict)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          node modules/easytier/scripts/fetch-xcframework.js --strict
+          cat modules/easytier/ios/Frameworks/.fetched.json
+          find modules/easytier/ios/Frameworks -maxdepth 3 | sort
+
+      - name: Expo autolinking sees the module
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          npx expo-modules-autolinking resolve --platform apple --json > autolinking.json || npx expo-modules-autolinking resolve --platform ios --json > autolinking.json
+          node -e '
+            const r = require("./autolinking.json");
+            const m = (r.modules || []).find((x) => x.packageName === "easytier" || (x.pods || []).some((p) => p.podName === "EasyTier"));
+            console.log(JSON.stringify(m, null, 2));
+            if (!m) { console.error("EasyTier module not autolinked"); process.exit(1); }
+          '
+
+      - name: expo prebuild (ios, clean)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild -p ios --clean --no-install
+          grep -n "platform :ios" ios/Podfile || true
+          cat ios/Podfile.properties.json || true
+
+      - name: pod install
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: |
+          set -euo pipefail
+          pod install 2>&1 | tee ../pod-install.log
+          if grep -q "\[EasyTier\].*not found" ../pod-install.log; then
+            echo "::error::podspec did not find the xcframework (stub build)"; exit 1
+          fi
+          grep -n "EasyTier" Podfile.lock
+          echo "--- EasyTier pod xcconfig ---"
+          cat "Pods/Target Support Files/EasyTier/"*.xcconfig
+          grep -q -- "-DEASYTIER_FFI_VENDORED" "Pods/Target Support Files/EasyTier/"*.xcconfig \
+            || { echo "::error::EASYTIER_FFI_VENDORED missing from the EasyTier pod xcconfig"; exit 1; }
+          echo "EASYTIER_FFI_VENDORED present in pod xcconfig"
+
+      - name: xcodebuild Release (iphonesimulator)
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: |
+          set -uo pipefail
+          WS=$(ls -d *.xcworkspace | head -1); SCHEME="${WS%.xcworkspace}"
+          echo "workspace=$WS scheme=$SCHEME"
+          xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ../build CODE_SIGNING_ALLOWED=NO build > ../xcodebuild.log 2>&1
+          rc=$?
+          echo "xcodebuild exit code: $rc"
+          echo "--- errors/warnings mentioning EasyTier ---"
+          grep -nE "EasyTier.*(error|warning):|(error|warning):.*EasyTier" ../xcodebuild.log | head -50 || true
+          echo "--- link problems ---"
+          grep -nE "Undefined symbols|duplicate symbol|ld: (error|warning)|clang: error|linker command failed" ../xcodebuild.log | head -50 || true
+          echo "--- errors ---"
+          grep -nE "^.*error: " ../xcodebuild.log | head -50 || true
+          tail -30 ../xcodebuild.log
+          exit $rc
+
+      - name: Tier 1 assertions
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          # The Swift compile of EasyTierModule.swift must carry -DEASYTIER_FFI_VENDORED.
+          if grep -E "swift-frontend|swiftc|SwiftCompile|SwiftDriver" xcodebuild.log | grep "EasyTier" | grep -q -- "-DEASYTIER_FFI_VENDORED"; then
+            echo "OK: EasyTier Swift compiled with -DEASYTIER_FFI_VENDORED"
+          else
+            echo "::error::no EasyTier swift compile with -DEASYTIER_FFI_VENDORED found"; exit 1
+          fi
+          grep -o -- "-DEASYTIER_FFI_VENDORED" xcodebuild.log | wc -l | xargs echo "occurrences of -DEASYTIER_FFI_VENDORED in build log:"
+          if grep -qE "Undefined symbols|duplicate symbol" xcodebuild.log; then
+            echo "::error::undefined/duplicate symbols"; exit 1
+          fi
+          APP=$(ls -d build/Build/Products/Release-iphonesimulator/*.app | head -1)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          ls -la "$APP" | head -40
+          du -sh "$APP"; ls -lh "$BIN"; file "$BIN"
+          otool -L "$BIN"
+          echo "--- EasyTier FFI symbols in the app binary (may be stripped) ---"
+          nm -m "$BIN" 2>/dev/null | grep -E "run_network_instance|collect_network_infos|retain_network_instance|parse_config|get_error_msg|free_string" | head || echo "(not in symbol table)"
+          find build -name "libEasyTier.a" -o -name "EasyTier.framework" | head
+          LIB=$(find build/Build/Products/Release-iphonesimulator -name "libEasyTier.a" | head -1)
+          if [ -n "$LIB" ]; then nm "$LIB" 2>/dev/null | grep -E " U _(run_network_instance|collect_network_infos)" || true; fi
+
+      # ---------------- Tier 2 ----------------
+
+      - name: Download xcframework for the hub binary
+        run: |
+          set -euo pipefail
+          mkdir -p build && cd build
+          curl -fsSL -o EasyTierFFI.xcframework.zip \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/v2.6.4-1/EasyTierFFI.xcframework.zip"
+          echo "0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090  EasyTierFFI.xcframework.zip" | shasum -a 256 -c -
+          unzip -q EasyTierFFI.xcframework.zip
+
+      - name: Compile hub binary (smoke --hub-only)
+        run: |
+          set -euo pipefail
+          SIM=build/EasyTierFFI.xcframework/ios-arm64-simulator
+          xcrun --sdk iphonesimulator swiftc -target arm64-apple-ios15.1-simulator -O \
+            -I "$SIM/Headers" -L "$SIM" -leasytier_ffi \
+            -liconv -framework SystemConfiguration -framework CoreFoundation \
+            smoke/main.swift -o build/smoke
+          codesign -s - -f build/smoke
+
+      - name: Boot simulator
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          c = [(rt, x) for rt, xs in d.items() if "iOS" in rt for x in xs if x["name"].startswith("iPhone")]
+          c.sort(key=lambda p: p[0])
+          rt, x = c[-1]
+          print(x["udid"])
+          print(rt, x["name"], file=sys.stderr)
+          ')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Run app against hub
+        run: |
+          set -uo pipefail
+          ABS=$PWD
+          OUT=$ABS/build/e2e
+          mkdir -p "$OUT"
+          python3 expo-module/harness/server.py "$OUT/result.json" > "$OUT/server.log" 2>&1 &
+          xcrun simctl spawn "$UDID" log stream --style compact \
+            --predicate 'eventMessage CONTAINS "EASYTIER" OR process == "e2e"' > "$OUT/app-log.txt" 2>&1 &
+          perl -e 'alarm shift; exec @ARGV' 300 xcrun simctl spawn "$UDID" "$ABS/build/smoke" --hub-only "$ABS/smoke/hub.toml" 240 > "$OUT/hub.log" 2>&1 &
+          sleep 5
+          cat "$OUT/hub.log"
+          xcrun simctl install "$UDID" "$APP" || { codesign -s - -f --deep "$APP" && xcrun simctl install "$UDID" "$APP"; }
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          for i in $(seq 1 150); do
+            [ -s "$OUT/result.json" ] && break
+            sleep 1
+          done
+          xcrun simctl io "$UDID" screenshot "$OUT/screen.png" || true
+          echo "--- hub.log ---"; cat "$OUT/hub.log"
+          echo "--- server.log ---"; cat "$OUT/server.log"
+          echo "--- app log (EASYTIER lines) ---"; grep "EASYTIER" "$OUT/app-log.txt" | tail -40 || true
+          if [ ! -s "$OUT/result.json" ]; then
+            echo "::error::no result from the app"
+            tail -100 "$OUT/app-log.txt"
+            ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -5
+            exit 1
+          fi
+          echo "--- result.json ---"
+          python3 -m json.tool "$OUT/result.json"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("PASS" if r.get("pass") else "FAIL", r.get("checks")); sys.exit(0 if r.get("pass") else 1)' "$OUT/result.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: expo-module-logs
+          path: |
+            e2e-work/e2e/pod-install.log
+            e2e-work/e2e/xcodebuild.log
+            e2e-work/e2e/autolinking.json
+            build/e2e/
+          if-no-files-found: ignore
