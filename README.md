@@ -148,6 +148,39 @@ Run [37226634830](https://github.com/ZiJie-Duan/easytier-ios-build/actions/runs/
 - **Receiver with `no_tun`** (the in-process hub): TCP that arrives for the node's own virtual IP is terminated in userspace. For the TCP path this happens in `gateway/tcp_proxy.rs`, where `check_packet_from_peer` accepts `dst == own vIP` when `no_tun` is set and smoltcp terminates it. For KCP it happens in `kcp_proxy.rs`. In both cases the node then dials **`127.0.0.1:<port>`**, because `is_ip_local_virtual_ip` causes the address to be rewritten to loopback. The echo server saw connections from `127.0.0.1`. A `no_tun` node therefore accepts inbound connections on its vIP, but only for services listening on loopback.
 - **Real server node `10.144.144.50`** (Linux, with TUN): the loopback rewrite applies only when `no_tun` is set. With KCP (the default), `KcpProxyDst` dials `10.144.144.50:8080` itself. Without KCP, the TCP packets are written to the TUN device and the kernel delivers them. Either way the service must listen on `0.0.0.0:8080` or `10.144.144.50:8080` (**not** only `127.0.0.1`), and the server's firewall must allow it on the TUN interface. The port must not be one of EasyTier's own listener ports or a protected RPC port (`should_deny_proxy`). Keeping `kcp_input` enabled on the server (the default) keeps the faster KCP path.
 
+## Expo module CI
+
+[`.github/workflows/expo-module-ios.yml`](.github/workflows/expo-module-ios.yml) checks that the app's local Expo native module ([`expo-module/easytier/`](expo-module/easytier): `EasyTierModule.swift`, `EasyTier.podspec`, `expo-module.config.json`, `scripts/fetch-xcframework.js`, `xcframework.json`) builds and runs inside a real **Expo SDK 57** iOS app. It runs on `macos-26`, because SDK 57 needs Xcode 26.4 or newer and `macos-15` only goes up to 26.3. It triggers on `workflow_dispatch` and on pushes to `main` that touch `expo-module/**`, `smoke/**` or the workflow file.
+
+**Tier 1: build.** The job scaffolds a fresh app with `npx create-expo-app@latest e2e --template blank-typescript@sdk-57`. It copies the module to `e2e/modules/easytier` (autolinked from `modules/`) and sets `ios.bundleIdentifier` and the app's ATS setting (`NSAllowsLocalNetworking`). Then it runs `fetch-xcframework.js --strict`, which downloads the pinned v2.6.4-1 zip and checks its sha256, followed by `expo prebuild -p ios --clean` and `pod install`. Finally it builds with `xcodebuild -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO`. The job fails if any of these is missing:
+- `-DEASYTIER_FFI_VENDORED` in the EasyTier pod xcconfig and in the Swift compiler invocations of the `EasyTier` pod. This means the real FFI path was compiled, not the stub.
+- a clean link, with no `Undefined symbols` or `duplicate symbol`. The app binary exports `_run_network_instance`, `_collect_network_infos`, `_retain_network_instance`, `_parse_config`, `_get_error_msg` and `_free_string`.
+
+**Tier 2: run.** The harness [`expo-module/harness/App.tsx`](expo-module/harness/App.tsx) replaces `App.tsx` and calls `requireNativeModule('EasyTier')` directly. It runs these steps in order:
+1. Calls `isFrameworkLinked`.
+2. Calls `validateConfig` with a good config, then with a bad one. The bad config must reject, and the error must not contain the secret.
+3. Calls `start` with the same TOML as [`smoke/trinity.toml`](smoke/trinity.toml).
+4. Listens for `onStatusChange` events and polls `getStatus` until `10.144.144.50` appears in the routes.
+5. Calls `fetch('http://127.0.0.1:18081/hello')` through the port forward.
+6. Calls `stop`.
+
+On the host side, [`expo-module/harness/server.py`](expo-module/harness/server.py) serves `127.0.0.1:8080`, the service behind the `no_tun` hub, and collects the JSON result the app POSTs to `127.0.0.1:18999` (the simulator shares the host's loopback). The hub is `smoke --hub-only smoke/hub.toml <seconds>`, started with `xcrun simctl spawn` right before `simctl launch`. The test passes only if every check in the result is true. The result, the hub, server and app logs, a screenshot, `pod-install.log` and `xcodebuild.log` are uploaded as the `expo-module-logs` artifact.
+
+Results ([run 37229800882](https://github.com/ZiJie-Duan/easytier-ios-build/actions/runs/37229800882), Xcode 26.6, iOS 26.5 simulator):
+
+| Check | Result |
+|---|---|
+| `EASYTIER_FFI_VENDORED` active (3 Swift compiler invocations, `-target arm64-apple-ios16.4-simulator`) | PASS |
+| Release `.app` links, FFI symbols present, app is 46 MB with a 19 MB binary | PASS |
+| `isFrameworkLinked === true`, `validateConfig` good/bad, secret redacted in the error | PASS |
+| `start`; `my_node_info.virtual_ipv4` = 10.144.144.149; hub `10.144.144.50` in routes after 1.1 s | PASS |
+| `fetch` via `127.0.0.1:18081` returns HTTP 200 `hello-from-hub ...` | PASS |
+| `onStatusChange` events with `infoJson`; `stop` then `getStatus().running === false` | PASS |
+
+One fix was needed. Without it, a generic-simulator Release build also compiles the pod for `x86_64`, and that fails with `no such module 'EasyTierFFI'` because the xcframework has no x86_64 simulator slice. The podspec in `expo-module/easytier` therefore sets `EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64` for the pod and for the app target. Device builds are not affected.
+
+To run it, open Actions, choose **expo-module-ios** and click **Run workflow**, or use `gh workflow run expo-module-ios.yml`. A run takes about 15 minutes.
+
 ## API
 
 See [`include/easytier_ffi.h`](include/easytier_ffi.h): `run_network_instance(toml)`, `retain_network_instance`, `collect_network_infos`, `parse_config`, `set_tun_fd`, `get_error_msg`, `free_string`.
