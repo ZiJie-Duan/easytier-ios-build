@@ -5,7 +5,7 @@ Builds [EasyTier](https://github.com/EasyTier/EasyTier)'s C FFI (`easytier-contr
 Upstream EasyTier does not ship iOS builds; this repo only adds the build scripts and does not modify EasyTier's source beyond two Cargo.toml tweaks at build time:
 
 - `crate-type = ["staticlib"]` (iOS apps cannot load third-party dylibs)
-- trimmed feature set (default `tun,magic-dns,smoltcp,socks5,kcp,zstd`), aimed at in-process `no_tun` mode with `port_forward` — no Network Extension needed (`tun`/`magic-dns` are compiled in only because the iOS code path requires them; see Build notes)
+- trimmed feature set (default `tun,magic-dns,smoltcp,socks5,kcp,zstd,aes-gcm`), aimed at in-process `no_tun` mode with `port_forward` — no Network Extension needed (`tun`/`magic-dns` are compiled in only because the iOS code path requires them; see Build notes)
 
 ## Output
 
@@ -24,7 +24,7 @@ Locally on a Mac (Xcode, rustup, protoc installed):
 
 ```bash
 ./scripts/build.sh
-EASYTIER_REF=v2.6.4 FEATURES=tun,magic-dns,smoltcp,socks5,kcp,zstd ./scripts/build.sh
+EASYTIER_REF=v2.6.4 FEATURES=tun,magic-dns,smoltcp,socks5,kcp,zstd,aes-gcm ./scripts/build.sh
 ```
 
 ## Build notes
@@ -47,7 +47,8 @@ There were no other iOS-specific compile problems: `--locked` resolved fine, and
 
 ### Final configuration
 
-- Features: `tun,magic-dns,smoltcp,socks5,kcp,zstd` with `default-features = false`. Not included: `wireguard`, `websocket`, `quic`, `faketcp`, `aes-gcm`, `openssl-crypto`. Peers must therefore be reached over `tcp://` or `udp://`, not `ws`/`wss`/`quic`/`wg`. `ring` is still linked in through other dependencies.
+- Features: `tun,magic-dns,smoltcp,socks5,kcp,zstd,aes-gcm` with `default-features = false`. Not included: `wireguard`, `websocket`, `quic`, `faketcp`, `openssl-crypto`. Peers must therefore be reached over `tcp://` or `udp://`, not `ws`/`wss`/`quic`/`wg`. `ring` is still linked in through other dependencies.
+- **`aes-gcm` is required to join a standard network.** EasyTier's default `encryption_algorithm` is `aes-gcm` only when one of `aes-gcm` / `wireguard` / `openssl-crypto` is compiled in; without them it silently falls back to `xor`. Desktop builds (default features include `wireguard`) then cannot decrypt the phone's packets: the handshake and pings succeed, but route sync never completes and the phone gets no routes (seen with release `v2.6.4-1`). The pure-Rust `aes-gcm` cipher uses the same `StandardAeadTail` layout as the `ring` cipher desktop nodes use, so the two interoperate.
 - `native-static-libs` (link these in the app; Xcode links most of them by default):
   `-framework CoreFoundation -framework SystemConfiguration -lc -liconv -lSystem -lm`
 - Static lib sizes: `ios-arm64` 31.3 MB, `ios-arm64-simulator` 31.1 MB (before stripping; most of this is dropped at app link time). The zip is about 19.7 MB.
