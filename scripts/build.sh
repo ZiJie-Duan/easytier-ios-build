@@ -34,6 +34,16 @@ if [[ ! -d $SRC/.git ]]; then
 fi
 EASYTIER_COMMIT=$(git -C "$SRC" rev-parse --short HEAD)
 
+log "Applying source patches (patches/*.patch)"
+for patch in "$ROOT"/patches/*.patch; do
+  [[ -e $patch ]] || continue
+  # Re-runs start from a clean tree: revert a previous application first.
+  git -C "$SRC" apply --reverse --check "$patch" 2>/dev/null && git -C "$SRC" apply --reverse "$patch"
+  git -C "$SRC" apply --check "$patch" || { echo "patch does not apply: $patch"; exit 1; }
+  git -C "$SRC" apply "$patch"
+  echo "applied $(basename "$patch")"
+done
+
 log "Patching easytier-ffi: staticlib + trimmed features"
 git -C "$SRC" checkout -- easytier-contrib/easytier-ffi/Cargo.toml
 python3 - "$SRC/easytier-contrib/easytier-ffi/Cargo.toml" "$FEATURES" <<'EOF'
@@ -89,9 +99,12 @@ xcodebuild -create-xcframework "${XC_ARGS[@]}" -output "$OUT/EasyTierFFI.xcframe
 
 NATIVE_LIBS=$(grep -h "native-static-libs:" "$LOGS"/*.log | head -1 | sed 's/.*native-static-libs: //')
 
+PATCHES=$(cd "$ROOT/patches" 2>/dev/null && ls *.patch 2>/dev/null | tr '\n' ' ')
+
 cat > "$OUT/BUILD_INFO.txt" <<EOF
 easytier_ref=$EASYTIER_REF
 easytier_commit=$EASYTIER_COMMIT
+patches=$PATCHES
 features=$FEATURES
 targets=$TARGETS
 ios_deployment_target=$IPHONEOS_DEPLOYMENT_TARGET

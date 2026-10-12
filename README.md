@@ -2,7 +2,7 @@
 
 Builds [EasyTier](https://github.com/EasyTier/EasyTier)'s C FFI (`easytier-contrib/easytier-ffi`) as an iOS static library and packages it as `EasyTierFFI.xcframework`, ready to embed in an iOS app or an Expo native module.
 
-Upstream EasyTier does not ship iOS builds; this repo only adds the build scripts and does not modify EasyTier's source beyond two Cargo.toml tweaks at build time:
+Upstream EasyTier does not ship iOS builds; this repo adds the build scripts, two Cargo.toml tweaks at build time, and one small source patch (`patches/`, see below):
 
 - `crate-type = ["staticlib"]` (iOS apps cannot load third-party dylibs)
 - trimmed feature set (default `tun,magic-dns,smoltcp,socks5,kcp,zstd,aes-gcm`), aimed at in-process `no_tun` mode with `port_forward` — no Network Extension needed (`tun`/`magic-dns` are compiled in only because the iOS code path requires them; see Build notes)
@@ -44,6 +44,19 @@ Results for EasyTier `v2.6.4` (commit `8428a89`), rustc 1.95.0, `IPHONEOS_DEPLOY
 3. **Symbol check failed although the symbols were present** — `nm -gU lib.a | grep -q` under `set -o pipefail` fails when `grep -q` exits early and `nm` gets SIGPIPE. Fix: write `nm` output to `build/logs/<target>.symbols.txt` and grep that file.
 
 There were no other iOS-specific compile problems: `--locked` resolved fine, and `tun-easytier`, `kcp-sys`, `zstd-sys`, `ring` and `hickory` all built for `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+
+### Source patch: credential nodes from TOML (`patches/credential-toml.patch`, since v2.6.4-3)
+
+EasyTier v2.6.4 can admit a node with a per-user **credential** instead of the network secret (`easytier-cli credential generate` on an admin node, `easytier-core --secure-mode --credential <key>` on the new node); revoking the credential removes that node from the whole network. But `TomlConfigLoader::new_from_str` — the only config path the FFI has — always rebuilds the network identity from `network_secret` (empty when absent), so a credential node started from TOML presents a digest of the empty secret and is rejected (`invalid proof and unknown credential`). It also never derives `secure_mode.local_public_key`, which the CLI does.
+
+The patch (in `easytier/src/common/config.rs`, `new_from_str`):
+
+- `[secure_mode] enabled = true` → fill in missing keys with `process_secure_mode_cfg`, like the CLI;
+- no `network_secret` + `secure_mode.local_private_key` → `NetworkIdentity::new_credential`, like `--credential`.
+
+Configs with a `network_secret` behave exactly as before. Verified on Linux with the FFI built from the same features (Python ctypes, same calls as the Swift bridge): a TOML credential node joins in ~2 s, reaches a service through `port_forward`, is dropped by every node within seconds of `credential revoke`, and reconnects normally after a restart. Without the patch the same TOML is rejected.
+
+Secure mode is all-or-nothing: secure and non-secure nodes reject each other's handshake (`unexpected packet type during handshake`), so a network switches every node at once.
 
 ### Final configuration
 
