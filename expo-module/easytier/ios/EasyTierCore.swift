@@ -55,9 +55,9 @@ final class EasyTierCore {
     #endif
   }
 
-  /// What this binary can do beyond a plain start / stop (M22-6).
+  /// What this binary can do beyond a plain start / stop (M22-6, `lowerPeerId` M22-7).
   static var features: [String] {
-    isFrameworkLinked ? ["nativeRestart", "pathRestart", "launchStart", "keepSameConfig"] : []
+    isFrameworkLinked ? ["nativeRestart", "pathRestart", "launchStart", "keepSameConfig", "lowerPeerId"] : []
   }
 
   // MARK: - Lifecycle (queue only)
@@ -70,17 +70,21 @@ final class EasyTierCore {
       return true
     }
     _ = stopAllOnQueue()
+    try runOnQueue(toml: toml)
+    self.instanceName = instanceName
+    runningToml = toml
+    return false
+  }
 
+  /// Runs `toml` with a fresh peer id below the previous instance's (see `nextPeerIdOnQueue`).
+  private func runOnQueue(toml: String) throws {
     #if EASYTIER_FFI_VENDORED
-    let rc = toml.withCString { run_network_instance($0) }
+    let config = EasyTierCore.withPeerId(toml, nextPeerIdOnQueue())
+    let rc = config.withCString { run_network_instance($0) }
     if rc != 0 {
       throw EasyTierCoreError.start(lastErrorMessage())
     }
     #endif
-
-    self.instanceName = instanceName
-    runningToml = toml
-    return false
   }
 
   /// Stops every instance. Returns an error message on failure.
@@ -100,7 +104,7 @@ final class EasyTierCore {
     return nil
   }
 
-  /// Restarts the running config: a new instance (a new random peer id) dials the hub at once.
+  /// Restarts the running config: a new instance (a new, lower peer id) dials the hub at once.
   /// Measured against an unpatched hub (M22-6), this is the fastest way back from a dead path:
   /// ~0.1 s plus the handshake. Keeping the peer id was slower (2–9 s): the hub keeps sending to
   /// the old, silently dead connection of that id until it re-picks its link every 5 s.
@@ -109,14 +113,66 @@ final class EasyTierCore {
       throw EasyTierCoreError.notRunning
     }
     _ = stopAllOnQueue()
-    #if EASYTIER_FFI_VENDORED
-    let rc = toml.withCString { run_network_instance($0) }
-    if rc != 0 {
-      throw EasyTierCoreError.start(lastErrorMessage())
-    }
-    #endif
+    try runOnQueue(toml: toml)
     instanceName = name
     runningToml = toml
+  }
+
+  // MARK: - Peer id (queue only)
+
+  /// The phone's credential is non-reusable: while the hub still holds the previous instance
+  /// (its link died silently), it keeps only the LOWEST peer id with that credential and drops the
+  /// others (`collect_non_reusable_credential_owners`). A random id lost that election half the
+  /// time and waited 7–8 s for the hub to time the old node out (M22-7, measured); an id below
+  /// the previous one wins at once. Random inside a window, so phones restarting together
+  /// (an office Wi-Fi coming back) still pick distinct ids.
+  private static let peerIdDefaultsKey = "expo.modules.easytier.peer-id"
+  private static let peerIdWindow: UInt32 = 1 << 20
+  private static let peerIdFloor: UInt32 = 1 << 24
+  /// After this long without a sign of life the hub has dropped the previous instance for sure,
+  /// so the id may start high again (it would otherwise only ever go down).
+  private static let peerIdStaleAfter: TimeInterval = 120
+  private var lastPeerId: UInt32?
+  private var peerAliveAt: Date?
+
+  private func nextPeerIdOnQueue() -> UInt32 {
+    let defaults = UserDefaults.standard
+    let saved = defaults.dictionary(forKey: EasyTierCore.peerIdDefaultsKey)
+    let previous = lastPeerId ?? (saved?["id"] as? NSNumber)?.uint32Value
+    let aliveAt = peerAliveAt ?? (saved?["aliveAt"] as? Double).map { Date(timeIntervalSince1970: $0) }
+    let recent = aliveAt.map { Date().timeIntervalSince($0) < EasyTierCore.peerIdStaleAfter } ?? false
+
+    let id: UInt32
+    if let previous = previous, recent, previous > EasyTierCore.peerIdFloor + EasyTierCore.peerIdWindow {
+      id = previous - 1 - UInt32.random(in: 0..<EasyTierCore.peerIdWindow)
+    } else {
+      id = UInt32.random(in: (UInt32.max / 2)...UInt32.max)
+    }
+    lastPeerId = id
+    markPeerAliveOnQueue(force: true)
+    return id
+  }
+
+  /// Remembers (at most every 10 s) that the current instance is up, so a relaunch soon after a
+  /// kill also picks a lower id.
+  private func markPeerAliveOnQueue(force: Bool = false) {
+    let now = Date()
+    if !force, let last = peerAliveAt, now.timeIntervalSince(last) < 10 {
+      return
+    }
+    peerAliveAt = now
+    guard let id = lastPeerId else { return }
+    UserDefaults.standard.set(
+      ["id": NSNumber(value: id), "aliveAt": now.timeIntervalSince1970],
+      forKey: EasyTierCore.peerIdDefaultsKey
+    )
+  }
+
+  /// `peer_id = n` as the first line: top-level keys must precede the first `[table]`.
+  static func withPeerId(_ toml: String, _ peerId: UInt32) -> String {
+    let lines = toml.split(separator: "\n", omittingEmptySubsequences: false)
+      .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("peer_id") }
+    return "peer_id = \(peerId)\n" + lines.joined(separator: "\n")
   }
 
   func validate(toml: String) throws {
@@ -172,6 +228,7 @@ final class EasyTierCore {
       // Whether the instance is actually healthy is decided in JS from the JSON
       // (`running`, `error_msg`); here it only means "the instance exists".
       status["running"] = true
+      markPeerAliveOnQueue()
     } else {
       status["error"] = "EasyTier instance '\(name)' is not running"
     }

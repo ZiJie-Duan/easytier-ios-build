@@ -148,7 +148,7 @@ async function run(log: (s: string) => void): Promise<Record<string, unknown>> {
 
   // v2.6.4-4 (Trinity M22-6): features, same config kept, native restart.
   r.features = mod.features ?? null;
-  checks.features = ['nativeRestart', 'pathRestart', 'launchStart', 'keepSameConfig'].every((f) => mod.features?.includes(f));
+  checks.features = ['nativeRestart', 'pathRestart', 'launchStart', 'keepSameConfig', 'lowerPeerId'].every((f) => mod.features?.includes(f));
   const peerBefore = info?.my_node_info?.peer_id ?? null;
   const again = await mod.start(TOML, 'trinity', 1000, [SECRET]);
   checks.keptSameConfig = !!again && (again as { kept?: boolean }).kept === true;
@@ -167,6 +167,11 @@ async function run(log: (s: string) => void): Promise<Record<string, unknown>> {
   }
   r.restartRecoverSec = back ? (Date.now() - tRestart) / 1000 : null;
   checks.restart = back;
+  // M22-7: the new instance must take a lower peer id (the hub keeps the lowest one per credential).
+  const stAfter = await mod.getStatus();
+  const peerAfter = stAfter.infoJson ? JSON.parse(stAfter.infoJson)?.my_node_info?.peer_id ?? null : null;
+  r.peerIds = { before: peerBefore, after: peerAfter };
+  checks.restartLowerPeerId = typeof peerBefore === 'number' && typeof peerAfter === 'number' && peerAfter < peerBefore;
   await mod.setLaunchConfig(TOML, 'trinity');
   await mod.setLaunchConfig(null, null);
   checks.launchConfig = true;
