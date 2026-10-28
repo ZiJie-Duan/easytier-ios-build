@@ -1,0 +1,571 @@
+diff --git a/easytier-contrib/easytier-ffi/src/lib.rs b/easytier-contrib/easytier-ffi/src/lib.rs
+index e9b65be..6e962e3 100644
+--- a/easytier-contrib/easytier-ffi/src/lib.rs
++++ b/easytier-contrib/easytier-ffi/src/lib.rs
+@@ -57,6 +57,32 @@ pub unsafe extern "C" fn set_tun_fd(
+     }
+ }
+ 
++/// # Safety
++/// Trinity: close every direct connection of the instance and dial again at once, keeping its
++/// peer id (a restart picks a new one). Returns 0, or -1 with `get_error_msg`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn reconnect_network_instance(
++    inst_name: *const std::ffi::c_char,
++) -> std::ffi::c_int {
++    let inst_name = unsafe {
++        assert!(!inst_name.is_null());
++        std::ffi::CStr::from_ptr(inst_name)
++            .to_string_lossy()
++            .into_owned()
++    };
++    let Some(inst_id) = INSTANCE_NAME_ID_MAP.get(&inst_name).map(|id| *id) else {
++        set_error_msg("instance not found");
++        return -1;
++    };
++    match INSTANCE_MANAGER.reconnect_network_instance(&inst_id) {
++        Ok(()) => 0,
++        Err(e) => {
++            set_error_msg(&format!("failed to reconnect: {}", e));
++            -1
++        }
++    }
++}
++
+ /// # Safety
+ /// Get the last error message
+ #[unsafe(no_mangle)]
+diff --git a/easytier/src/common/config.rs b/easytier/src/common/config.rs
+index 2914373..cd22d4a 100644
+--- a/easytier/src/common/config.rs
++++ b/easytier/src/common/config.rs
+@@ -157,6 +157,11 @@ pub trait ConfigLoader: Send + Sync {
+     fn get_id(&self) -> uuid::Uuid;
+     fn set_id(&self, id: uuid::Uuid);
+ 
++    /// Trinity: a fixed peer id for this node (`peer_id` in TOML). None = a random one per start.
++    fn get_peer_id(&self) -> Option<u32> {
++        None
++    }
++
+     fn get_hostname(&self) -> String;
+     fn set_hostname(&self, name: Option<String>);
+ 
+@@ -528,6 +533,8 @@ struct Config {
+     hostname: Option<String>,
+     instance_name: Option<String>,
+     instance_id: Option<uuid::Uuid>,
++    /// Trinity: fixed peer id, so a restarted node is the same node to the rest of the network.
++    peer_id: Option<u32>,
+     ipv4: Option<String>,
+     ipv6: Option<String>,
+     ipv6_public_addr_provider: Option<bool>,
+@@ -658,6 +665,10 @@ impl TomlConfigLoader {
+ }
+ 
+ impl ConfigLoader for TomlConfigLoader {
++    fn get_peer_id(&self) -> Option<u32> {
++        self.config.lock().unwrap().peer_id.filter(|id| *id != 0)
++    }
++
+     fn get_inst_name(&self) -> String {
+         self.config
+             .lock()
+diff --git a/easytier/src/connector/manual.rs b/easytier/src/connector/manual.rs
+index c797c50..b7e453e 100644
+--- a/easytier/src/connector/manual.rs
++++ b/easytier/src/connector/manual.rs
+@@ -52,6 +52,8 @@ struct ConnectorManagerData {
+     removed_conn_urls: Arc<DashSet<url::Url>>,
+     net_ns: NetNS,
+     global_ctx: ArcGlobalCtx,
++    // Trinity: wakes the reconnect routine at once (new connector, reconnect request).
++    kick: Arc<tokio::sync::Notify>,
+ }
+ 
+ pub struct ManualConnectorManager {
+@@ -75,6 +77,7 @@ impl ManualConnectorManager {
+                 removed_conn_urls: Arc::new(DashSet::new()),
+                 net_ns: global_ctx.net_ns.clone(),
+                 global_ctx,
++                kick: Arc::new(tokio::sync::Notify::new()),
+             }),
+             tasks,
+         };
+@@ -140,13 +143,20 @@ impl ManualConnectorManager {
+     {
+         tracing::info!("add_connector: {}", connector.remote_url());
+         self.data.connectors.insert(connector.remote_url());
++        self.data.kick.notify_one();
+     }
+ 
+     pub async fn add_connector_by_url(&self, url: url::Url) -> Result<(), Error> {
+         self.data.connectors.insert(url);
++        self.data.kick.notify_one();
+         Ok(())
+     }
+ 
++    /// Trinity: dial every dead connector now instead of at the next 1 s tick.
++    pub fn reconnect_now(&self) {
++        self.data.kick.notify_one();
++    }
++
+     pub async fn remove_connector(&self, url: url::Url) -> Result<(), Error> {
+         tracing::info!("remove_connector: {}", url);
+         let url = url.into();
+@@ -217,36 +227,65 @@ impl ManualConnectorManager {
+         let (reconn_result_send, mut reconn_result_recv) = mpsc::channel(100);
+         let tasks = Arc::new(std::sync::Mutex::new(JoinSet::new()));
+         join_joinset_background(tasks.clone(), "connector_reconnect_tasks".to_string());
++        // Trinity: a lost connection, a new connector or a reconnect request is dialled at once,
++        // not at the next 1 s tick (which made every start and every reconnect wait up to a second).
++        let mut events = data.global_ctx.subscribe();
++        let mut events_open = true;
++        // Event-driven scans at most this often: a node that is rejected right after its handshake
++        // (e.g. a duplicate credential) must not redial in a tight loop.
++        const MIN_EVENT_SCAN_GAP: Duration = Duration::from_millis(500);
++        let mut last_scan = Instant::now() - MIN_EVENT_SCAN_GAP;
+ 
+         loop {
+-            tokio::select! {
+-                _ = reconn_interval.tick() => {
+-                    let dead_urls = Self::collect_dead_conns(data.clone()).await;
+-                    if dead_urls.is_empty() {
+-                        continue;
++            let scan = tokio::select! {
++                _ = reconn_interval.tick() => Some(false),
++                _ = data.kick.notified() => Some(true),
++                ev = events.recv(), if events_open => match ev {
++                    Ok(GlobalCtxEvent::PeerConnRemoved(_)) | Ok(GlobalCtxEvent::PeerRemoved(_)) => Some(true),
++                    Ok(_) => None,
++                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(true),
++                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
++                        events_open = false;
++                        None
+                     }
+-                    for dead_url in dead_urls {
+-                        let data_clone = data.clone();
+-                        let sender = reconn_result_send.clone();
+-                        data.connectors.remove(&dead_url).unwrap();
+-                        let insert_succ = data.reconnecting.insert(dead_url.clone());
+-                        assert!(insert_succ);
+-
+-                        tasks.lock().unwrap().spawn(async move {
+-                            let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone() ).await;
+-                            let _ = sender.send(reconn_ret).await;
+-
+-                            data_clone.reconnecting.remove(&dead_url).unwrap();
+-                            data_clone.connectors.insert(dead_url.clone());
+-                        });
+-                    }
+-                    tracing::info!("reconn_interval tick, done");
+-                }
+-
++                },
+                 ret = reconn_result_recv.recv() => {
+                     tracing::warn!("reconn_tasks done, reconn result: {:?}", ret);
++                    None
++                }
++            };
++            let Some(early) = scan else {
++                continue;
++            };
++            if early {
++                let since = last_scan.elapsed();
++                if since < MIN_EVENT_SCAN_GAP {
++                    tokio::time::sleep(MIN_EVENT_SCAN_GAP - since).await;
+                 }
+             }
++            last_scan = Instant::now();
++
++            let dead_urls = Self::collect_dead_conns(data.clone()).await;
++            if dead_urls.is_empty() {
++                continue;
++            }
++            for dead_url in dead_urls {
++                let data_clone = data.clone();
++                let sender = reconn_result_send.clone();
++                data.connectors.remove(&dead_url).unwrap();
++                let insert_succ = data.reconnecting.insert(dead_url.clone());
++                assert!(insert_succ);
++
++                tasks.lock().unwrap().spawn(async move {
++                    let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone()).await;
++                    let _ = sender.send(reconn_ret).await;
++
++                    data_clone.reconnecting.remove(&dead_url).unwrap();
++                    data_clone.connectors.insert(dead_url.clone());
++                    // Trinity: a failed attempt is retried on the next tick (1 s), a successful one needs nothing.
++                });
++            }
++            tracing::info!("reconn scan done");
+         }
+     }
+ 
+diff --git a/easytier/src/gateway/socks5.rs b/easytier/src/gateway/socks5.rs
+index 0cd5d07..3f38803 100644
+--- a/easytier/src/gateway/socks5.rs
++++ b/easytier/src/gateway/socks5.rs
+@@ -245,6 +245,9 @@ impl AsyncTcpConnector for Socks5KcpConnector {
+     }
+ }
+ 
++/// Trinity: how long a forwarded connection to a virtual-network address waits for its route.
++const VIRTUAL_ROUTE_WAIT: Duration = Duration::from_secs(5);
++
+ struct Socks5AutoConnector {
+     #[cfg(feature = "kcp")]
+     kcp_endpoint: Option<Weak<KcpEndpoint>>,
+@@ -281,6 +284,27 @@ impl AsyncTcpConnector for Socks5AutoConnector {
+             addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port());
+         }
+ 
++        // Trinity: an address inside our own virtual network has no route yet (start-up, a
++        // reconnect, a route that blinked): wait briefly for it instead of dialling it over the
++        // phone's own network, where it never answers and the connection hung for 10 s.
++        if self.smoltcp_net.is_some()
++            && !addr.ip().is_loopback()
++            && let IpAddr::V4(v4) = addr.ip()
++            && peer_mgr_arc
++                .get_global_ctx()
++                .get_ipv4()
++                .is_some_and(|inet| inet.network().contains(&v4))
++            && peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
++        {
++            let deadline = Instant::now() + VIRTUAL_ROUTE_WAIT;
++            while peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty() {
++                if Instant::now() >= deadline {
++                    return Err(anyhow::anyhow!("no route to {} in the virtual network", addr).into());
++                }
++                tokio::time::sleep(Duration::from_millis(25)).await;
++            }
++        }
++
+         if self.smoltcp_net.is_none()
+             || peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
+             || addr.ip().is_loopback()
+@@ -701,7 +725,11 @@ impl Socks5Server {
+                                 ));
+                             }
+                         }
+-                        Err(err) => tracing::error!("accept error = {:?}", err),
++                        Err(err) => {
++                            tracing::error!("accept error = {:?}", err);
++                            // Trinity: never spin on a failing listener (see the port forward loop).
++                            tokio::time::sleep(Duration::from_millis(200)).await;
++                        }
+                     }
+                 }
+             });
+@@ -801,9 +829,10 @@ impl Socks5Server {
+ 
+     pub async fn add_tcp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+         let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
+-        let listener = bind::<TcpListener>()
++        let net_ns = self.global_ctx.net_ns.clone();
++        let mut listener = bind::<TcpListener>()
+             .addr(bind_addr)
+-            .net_ns(self.global_ctx.net_ns.clone())
++            .net_ns(net_ns.clone())
+             .call()?;
+ 
+         let net = self.net.clone();
+@@ -820,6 +849,7 @@ impl Socks5Server {
+             .insert(cfg.clone(), cancel_token.clone().drop_guard());
+ 
+         self.tasks.lock().unwrap().spawn(async move {
++            let mut accept_errors: u32 = 0;
+             loop {
+                 let (incoming_socket, addr) = select! {
+                     biased;
+@@ -829,14 +859,33 @@ impl Socks5Server {
+                     }
+                     res = listener.accept() => {
+                         match res {
+-                            Ok(result) => result,
++                            Ok(result) => {
++                                accept_errors = 0;
++                                result
++                            }
+                             Err(err) => {
+-                                tracing::error!("port forward accept error = {:?}", err);
++                                // Trinity: iOS can invalidate a listening socket while the app is
++                                // suspended; accept then fails at once, forever, and this loop spun
++                                // a core. Back off, and after a few failures bind a fresh listener.
++                                accept_errors += 1;
++                                tracing::error!(accept_errors, "port forward accept error = {:?}", err);
++                                tokio::time::sleep(Duration::from_millis(50 * accept_errors.min(20) as u64)).await;
++                                if accept_errors >= 3 {
++                                    match bind::<TcpListener>().addr(bind_addr).net_ns(net_ns.clone()).call() {
++                                        Ok(fresh) => {
++                                            tracing::warn!(?bind_addr, "port forward listener rebound");
++                                            listener = fresh;
++                                            accept_errors = 0;
++                                        }
++                                        Err(e) => tracing::error!(?bind_addr, "port forward rebind failed: {:?}", e),
++                                    }
++                                }
+                                 continue;
+                             }
+                         }
+                     }
+                 };
++                let _ = incoming_socket.set_nodelay(true);
+ 
+                 tracing::info!(
+                     "port forward: accept new connection from {:?} to {:?}",
+diff --git a/easytier/src/gateway/tokio_smoltcp/reactor.rs b/easytier/src/gateway/tokio_smoltcp/reactor.rs
+index 21a735e..cad0b58 100644
+--- a/easytier/src/gateway/tokio_smoltcp/reactor.rs
++++ b/easytier/src/gateway/tokio_smoltcp/reactor.rs
+@@ -148,7 +148,10 @@ impl Reactor {
+         &self.socket_allocator
+     }
+     pub fn notify(&self) {
+-        self.notify.notify_waiters();
++        // Trinity: the reactor loop is the only waiter and it is not always parked in its select
++        // (it may be sending or polling). notify_waiters() then wakes nobody and the wake-up is
++        // lost until the next packet or timer (up to ~10 s); notify_one() stores a permit.
++        self.notify.notify_one();
+     }
+     pub fn iface(&self) -> &BufferInterface {
+         &self.iface
+diff --git a/easytier/src/instance/instance.rs b/easytier/src/instance/instance.rs
+index 0f00908..f0d29bc 100644
+--- a/easytier/src/instance/instance.rs
++++ b/easytier/src/instance/instance.rs
+@@ -1159,6 +1159,28 @@ impl Instance {
+         self.peer_manager.wait().await;
+     }
+ 
++    /// Trinity (iOS): drop every direct connection and dial again at once, keeping this node's
++    /// peer id. A restart picks a new random id instead, and while the hub still holds the old
++    /// node a non-reusable credential elects one of the two and the other hangs for 7–40 s.
++    /// Returns the number of connections closed.
++    pub async fn reconnect_now(&self) -> usize {
++        let peer_map = self.peer_manager.get_peer_map();
++        let mut closed = 0;
++        for peer_id in peer_map.list_peers_with_conn().await {
++            for conn in peer_map.list_peer_conns(peer_id).await.unwrap_or_default() {
++                let Ok(conn_id) = conn.conn_id.parse::<PeerConnId>() else {
++                    continue;
++                };
++                if peer_map.close_peer_conn(peer_id, &conn_id).await.is_ok() {
++                    closed += 1;
++                }
++            }
++        }
++        self.conn_manager.reconnect_now();
++        tracing::info!(closed, "reconnect requested: direct connections closed, dialling again");
++        closed
++    }
++
+     pub fn id(&self) -> uuid::Uuid {
+         self.id
+     }
+diff --git a/easytier/src/instance_manager.rs b/easytier/src/instance_manager.rs
+index 229cb86..46c2674 100644
+--- a/easytier/src/instance_manager.rs
++++ b/easytier/src/instance_manager.rs
+@@ -235,6 +235,14 @@ impl NetworkInstanceManager {
+             .and_then(|instance| instance.value().get_api_service())
+     }
+ 
++    /// Trinity: close every direct connection of the instance and dial again at once, same peer id.
++    pub fn reconnect_network_instance(&self, instance_id: &uuid::Uuid) -> Result<(), anyhow::Error> {
++        self.instance_map
++            .get(instance_id)
++            .ok_or_else(|| anyhow::anyhow!("instance not found"))?
++            .send_command(crate::launcher::LauncherCommand::Reconnect)
++    }
++
+     pub fn set_tun_fd(&self, instance_id: &uuid::Uuid, fd: i32) -> Result<(), anyhow::Error> {
+         let sender = self
+             .instance_map
+diff --git a/easytier/src/launcher.rs b/easytier/src/launcher.rs
+index 12815d8..cae1fc2 100644
+--- a/easytier/src/launcher.rs
++++ b/easytier/src/launcher.rs
+@@ -40,22 +40,35 @@ pub struct Event {
+     event: GlobalCtxEvent,
+ }
+ 
++/// Trinity: requests to the running instance from outside its runtime (the FFI).
++#[derive(Debug, Clone, Copy)]
++pub enum LauncherCommand {
++    /// Close every direct connection and dial again at once, same peer id.
++    Reconnect,
++}
++
+ struct EasyTierData {
+     events: RwLock<VecDeque<Event>>,
+     tun_fd: (mpsc::Sender<TunFd>, Mutex<Option<mpsc::Receiver<TunFd>>>),
+     event_subscriber: RwLock<broadcast::Sender<GlobalCtxEvent>>,
+     instance_stop_notifier: Arc<tokio::sync::Notify>,
++    command: (
++        mpsc::UnboundedSender<LauncherCommand>,
++        Mutex<Option<mpsc::UnboundedReceiver<LauncherCommand>>>,
++    ),
+ }
+ 
+ impl Default for EasyTierData {
+     fn default() -> Self {
+         let (tx, _) = broadcast::channel(16);
+         let (sender, receiver) = mpsc::channel(16);
++        let (command_tx, command_rx) = mpsc::unbounded_channel();
+         Self {
+             event_subscriber: RwLock::new(tx),
+             events: RwLock::new(VecDeque::new()),
+             tun_fd: (sender, Mutex::new(Some(receiver))),
+             instance_stop_notifier: Arc::new(tokio::sync::Notify::new()),
++            command: (command_tx, Mutex::new(Some(command_rx))),
+         }
+     }
+ }
+@@ -166,7 +179,24 @@ impl EasyTierLauncher {
+             .replace(Arc::new(instance.get_api_rpc_service()));
+         drop(api_service);
+ 
+-        stop_signal.notified().await;
++        // Trinity: serve commands (reconnect) until stopped.
++        let mut commands = data.command.1.lock().unwrap().take();
++        loop {
++            tokio::select! {
++                _ = stop_signal.notified() => break,
++                cmd = async {
++                    match commands.as_mut() {
++                        Some(rx) => rx.recv().await,
++                        None => std::future::pending().await,
++                    }
++                } => match cmd {
++                    Some(LauncherCommand::Reconnect) => {
++                        instance.reconnect_now().await;
++                    }
++                    None => commands = None,
++                },
++            }
++        }
+ 
+         tasks.abort_all();
+         drop(tasks);
+@@ -244,6 +274,18 @@ impl EasyTierLauncher {
+         self.error_msg.read().unwrap().clone()
+     }
+ 
++    /// Trinity: ask the running instance to do something (see `LauncherCommand`).
++    pub fn send_command(&self, command: LauncherCommand) -> Result<(), anyhow::Error> {
++        if !self.running() {
++            return Err(anyhow::anyhow!("instance is not running"));
++        }
++        self.data
++            .command
++            .0
++            .send(command)
++            .map_err(|_| anyhow::anyhow!("instance is not accepting commands"))
++    }
++
+     pub fn running(&self) -> bool {
+         self.instance_alive
+             .load(std::sync::atomic::Ordering::Relaxed)
+@@ -398,6 +440,14 @@ impl NetworkInstance {
+         self.config.get_network_identity().network_name
+     }
+ 
++    /// Trinity: see `LauncherCommand`.
++    pub fn send_command(&self, command: LauncherCommand) -> Result<(), anyhow::Error> {
++        self.launcher
++            .as_ref()
++            .ok_or_else(|| anyhow::anyhow!("instance is not started"))?
++            .send_command(command)
++    }
++
+     pub fn get_tun_fd_sender(&self) -> Option<mpsc::Sender<TunFd>> {
+         self.launcher
+             .as_ref()
+diff --git a/easytier/src/peers/peer_manager.rs b/easytier/src/peers/peer_manager.rs
+index d5502ac..5635cc3 100644
+--- a/easytier/src/peers/peer_manager.rs
++++ b/easytier/src/peers/peer_manager.rs
+@@ -235,7 +235,10 @@ impl PeerManager {
+         global_ctx: ArcGlobalCtx,
+         nic_channel: PacketRecvChan,
+     ) -> Self {
+-        let my_peer_id = rand::random();
++        // Trinity: a configured peer id survives restarts. With a random one, a restart while the
++        // hub still holds the old node (FIN lost: network changed, app suspended) made the
++        // non-reusable credential elect one of the two, and the phone hung 7–40 s.
++        let my_peer_id = global_ctx.config.get_peer_id().unwrap_or_else(rand::random);
+ 
+         let (packet_send, packet_recv) = create_packet_recv_chan();
+         let peers = Arc::new(PeerMap::new(
+diff --git a/easytier/src/peers/peer_ospf_route.rs b/easytier/src/peers/peer_ospf_route.rs
+index 6081c0c..4e7d1e3 100644
+--- a/easytier/src/peers/peer_ospf_route.rs
++++ b/easytier/src/peers/peer_ospf_route.rs
+@@ -177,6 +177,18 @@ impl From<Version> for AtomicVersion {
+     }
+ }
+ 
++/// Trinity: first version of this node's own route / connection info. Upstream starts at 1 per
++/// instance; with a fixed peer id (`peer_id` in the config) a restarted instance must announce a
++/// higher version than the one the hub still holds for the old instance, or the hub answers
++/// DuplicatePeerId (and the old instance's info wins). Seconds since 2023-11-14 grow faster than
++/// a node's own info changes, so the newest instance always carries the highest version.
++fn initial_own_version() -> Version {
++    SystemTime::now()
++        .duration_since(SystemTime::UNIX_EPOCH)
++        .map(|d| d.as_secs().saturating_sub(1_700_000_000) as Version)
++        .unwrap_or(0)
++}
++
+ fn is_foreign_network_info_newer(
+     next: &ForeignNetworkRouteInfoEntry,
+     prev: &ForeignNetworkRouteInfoEntry,
+@@ -810,9 +822,11 @@ impl SyncedRouteInfo {
+                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
+             {
+                 // if dst peer send to us with higher version info of my peer, our peer id is duplicated
+-                // TODO: handle this better. restart peer manager?
+-                panic!("my peer id is duplicated");
+-                // return Err(Error::DuplicatePeerId);
++                // Trinity: a fixed peer id meets the previous instance's info after a restart; that
++                // must not crash the app (panic = abort). Refuse this sync; it is retried, and the
++                // old info expires on its own.
++                tracing::error!(peer_id = info.peer_id, "my peer id is duplicated (an older instance of this node?)");
++                return Err(Error::DuplicatePeerId);
+             }
+         } else if info.peer_id == dst_peer_id {
+             let Some(dst_peer_route_id) = dst_peer_route_id else {
+@@ -995,7 +1009,7 @@ impl SyncedRouteInfo {
+         );
+         let mut guard = self.peer_infos.upgradable_read();
+         let old = guard.get(&my_peer_id);
+-        let new_version = old.map(|x| x.version).unwrap_or(0) + 1;
++        let new_version = old.map(|x| x.version).unwrap_or_else(initial_own_version) + 1;
+         let need_insert_new = if let Some(old) = old {
+             RoutePeerInfo::try_update_new_peer_info(old, &mut new)
+         } else {
+@@ -1032,7 +1046,7 @@ impl SyncedRouteInfo {
+ 
+         let guard = self.conn_map.upgradable_read();
+         let my_conn_info = guard.get(&my_peer_id);
+-        let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1;
++        let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or_else(initial_own_version) + 1;
+ 
+         if my_conn_info.is_none_or(|old| old.connected_peers != connected_peers) {
+             let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+@@ -3033,9 +3047,11 @@ impl PeerRouteServiceImpl {
+             Ok(resp) => {
+                 if let Some(err) = resp.error {
+                     if err == Error::DuplicatePeerId as i32 {
+-                        if !self.global_ctx.get_feature_flags().is_public_server {
+-                            panic!("duplicate peer id");
+-                        }
++                        // Trinity: never crash the app here (see check_duplicate_peer_id); retry later.
++                        tracing::error!(?my_peer_id, ?dst_peer_id, "sync_route_info: duplicate peer id");
++                        session
++                            .need_sync_initiator_info
++                            .store(true, Ordering::Relaxed);
+                     } else {
+                         tracing::error!(?ret, ?my_peer_id, ?dst_peer_id, "sync_route_info failed");
+                         session

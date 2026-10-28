@@ -86,10 +86,11 @@ for target in $TARGETS; do
   # Dump to a file first: `nm | grep -q` under pipefail fails via SIGPIPE.
   nm -gU "$lib" 2>/dev/null > "$LOGS/$target.symbols.txt" || true
   for sym in parse_config run_network_instance retain_network_instance \
-             collect_network_infos set_tun_fd get_error_msg free_string; do
+             collect_network_infos set_tun_fd get_error_msg free_string \
+             reconnect_network_instance; do
     grep -E " T _${sym}$" "$LOGS/$target.symbols.txt" || { echo "symbol $sym not exported"; exit 1; }
   done
-  echo "all 7 symbols present"
+  echo "all 8 symbols present"
 
   XC_ARGS+=(-library "$lib" -headers "$ROOT/include")
 done

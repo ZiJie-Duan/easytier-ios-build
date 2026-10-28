@@ -34,6 +34,10 @@ int collect_network_infos(KeyValuePair *infos, size_t max_length);
 // Hand a TUN file descriptor to a running instance (unused in no_tun mode).
 int set_tun_fd(const char *inst_name, int fd);
 
+// (patches/fast-reconnect.patch) Close every direct connection of the instance and
+// dial again at once, keeping its peer id. A restart would pick a new random id.
+int reconnect_network_instance(const char *inst_name);
+
 // Write the last error message to `out` (NULL if none). Free it with free_string.
 void get_error_msg(const char **out);
 
