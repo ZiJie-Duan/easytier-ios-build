@@ -174,9 +174,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build && cd build
+          # Same release as the app (expo-module/easytier/xcframework.json): a hub from another build
+          # (v2.6.4-1 had no aes-gcm and fell back to xor) never completes route sync with the app.
+          TAG=$(node -p "require('$GITHUB_WORKSPACE/expo-module/easytier/xcframework.json').tag")
+          SHA=$(node -p "require('$GITHUB_WORKSPACE/expo-module/easytier/xcframework.json').sha256")
           curl -fsSL -o EasyTierFFI.xcframework.zip \
-            "https://github.com/${GITHUB_REPOSITORY}/releases/download/v2.6.4-1/EasyTierFFI.xcframework.zip"
-          echo "0c1bb7912ded9fe47d25b2cbb410d407a19aea7514fd01b4090d40edbc5b0090  EasyTierFFI.xcframework.zip" | shasum -a 256 -c -
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/EasyTierFFI.xcframework.zip"
+          echo "${SHA}  EasyTierFFI.xcframework.zip" | shasum -a 256 -c -
           unzip -q EasyTierFFI.xcframework.zip
 
       - name: Compile hub binary (smoke --hub-only)
