@@ -17,5 +17,7 @@ bash linux-lab/harness/run.sh patched netchange-restart 3
 a fresh phone container. `BINS_DIR` overrides where the binaries are. A "network change" is simulated by silently
 dropping the live TCP flow to the hub with iptables (no FIN, like a dead Wi-Fi path); new connections still work.
 The peer list also contains `192.0.2.1` (TEST-NET-1, never reachable), standing in for the app's LAN-only address.
+`PEER_ID` fixes the id of the first instance. With a random id, `netchange-restart` is slow about half the time:
+the hub elects the lowest id per non-reusable credential (see the top-level README). Take enough repetitions.
 
 Results (Docker bridge, RTT ≈ 0): see the fast-path section of the top-level README.

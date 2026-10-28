@@ -90,10 +90,12 @@ Measured on Linux (Docker, the FFI driven through Python ctypes the way the iOS 
 |---|---|---|
 | start → first HTTP response through the forward | 0.20 s | 0.03–0.11 s |
 | first request while the forward listens but has no route yet | 0.09–1.16 s | 0.03 s |
-| restart after the link died silently (network change) | 0.20 s | 0.11 s |
+| restart after the link died silently (network change), new id **below** the old one | 0.20 s | 0.11 s |
 | link silently dead, no restart (until EasyTier notices) | 13.8 s | — |
 
-Tried and dropped: reconnecting with the same peer id (closing the connections and redialling) and a fixed `peer_id` across restarts were *slower* (2–9 s): the hub keeps sending to the old, silently dead connection of that peer id until it re-picks the peer's connection (every 5 s). A restart with a new random id is the fastest way back.
+Tried and dropped: reconnecting with the same peer id (closing the connections and redialling) and a fixed `peer_id` across restarts were *slower* (2–9 s): the hub keeps sending to the old, silently dead connection of that peer id until it re-picks the peer's connection (every 5 s). A restart with a new id is the fastest way back.
+
+**The new id must be lower than the old one.** With a non-reusable credential the hub keeps only the *lowest* peer id per credential while both nodes look alive (`collect_non_reusable_credential_owners` in `peers/peer_ospf_route.rs`). A higher id is accepted and closed again within 5 ms (FIN + RST) on every dial, until the hub times the old node out: 7–10 s, which happened to about half of the random-id restarts. A first 3-run sample had missed this. Measured with `linux-lab/`: a lower id recovered in 0.11 s 5 of 5 times, a higher one took 7–8 s 2 of 2 times. The Expo module (`expo-module/easytier/ios/EasyTierCore.swift`) writes a `peer_id` at the top of the TOML on every start. It picks a random value in a 2^20 window just below the previous id, which it saves in UserDefaults, and goes back to a high random id after 120 s without a sign of life.
 
 ## Simulator smoke test
 
