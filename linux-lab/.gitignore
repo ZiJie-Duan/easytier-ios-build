@@ -1,3 +1,4 @@
 bins/
 harness/.cred
 *.log
+__pycache__/
