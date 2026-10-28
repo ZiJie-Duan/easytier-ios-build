@@ -13,8 +13,11 @@ import { ScrollView, Text } from 'react-native';
 type NativeStatus = { instanceName?: string; running: boolean; infoJson?: string; error?: string };
 type EasyTierNative = {
   isFrameworkLinked: boolean;
+  features?: string[];
   validateConfig(toml: string, redactions: string[]): Promise<void>;
-  start(toml: string, instanceName: string, pollIntervalMs: number, redactions: string[]): Promise<void>;
+  start(toml: string, instanceName: string, pollIntervalMs: number, redactions: string[]): Promise<{ kept?: boolean } | void>;
+  restart(): Promise<void>;
+  setLaunchConfig(toml: string | null, instanceName: string | null): Promise<void>;
   stop(): Promise<void>;
   getStatus(): Promise<NativeStatus>;
   addListener(event: 'onStatusChange', cb: (s: NativeStatus) => void): { remove(): void };
@@ -142,6 +145,32 @@ async function run(log: (s: string) => void): Promise<Record<string, unknown>> {
   r.fetchBody = body;
   checks.roundTrip = typeof body === 'string' && body.includes('hello-from-hub');
   log(`fetch body=${body}`);
+
+  // v2.6.4-4 (Trinity M22-6): features, same config kept, native restart.
+  r.features = mod.features ?? null;
+  checks.features = ['nativeRestart', 'pathRestart', 'launchStart', 'keepSameConfig'].every((f) => mod.features?.includes(f));
+  const peerBefore = info?.my_node_info?.peer_id ?? null;
+  const again = await mod.start(TOML, 'trinity', 1000, [SECRET]);
+  checks.keptSameConfig = !!again && (again as { kept?: boolean }).kept === true;
+  const stKept = await mod.getStatus();
+  checks.keptSamePeer = !!stKept.infoJson && JSON.parse(stKept.infoJson)?.my_node_info?.peer_id === peerBefore;
+  const tRestart = Date.now();
+  await mod.restart();
+  let back = false;
+  while (!back && Date.now() - tRestart < 20000) {
+    try {
+      const res = await withTimeout(fetch(`http://127.0.0.1:18081/hello?after=restart`), 5000, 'fetch');
+      back = (await res.text()).includes('hello-from-hub');
+    } catch {
+      await sleep(50);
+    }
+  }
+  r.restartRecoverSec = back ? (Date.now() - tRestart) / 1000 : null;
+  checks.restart = back;
+  await mod.setLaunchConfig(TOML, 'trinity');
+  await mod.setLaunchConfig(null, null);
+  checks.launchConfig = true;
+  log(`restart: back after ${r.restartRecoverSec}s`);
 
   await sleep(2500); // let a couple of 1 s poll events arrive
   r.eventCount = events.length;

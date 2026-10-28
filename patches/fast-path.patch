@@ -1,0 +1,252 @@
+diff --git a/easytier/src/connector/manual.rs b/easytier/src/connector/manual.rs
+index c797c50..155f74a 100644
+--- a/easytier/src/connector/manual.rs
++++ b/easytier/src/connector/manual.rs
+@@ -52,6 +52,8 @@ struct ConnectorManagerData {
+     removed_conn_urls: Arc<DashSet<url::Url>>,
+     net_ns: NetNS,
+     global_ctx: ArcGlobalCtx,
++    // Trinity: wakes the reconnect routine at once (a new connector).
++    kick: Arc<tokio::sync::Notify>,
+ }
+ 
+ pub struct ManualConnectorManager {
+@@ -75,6 +77,7 @@ impl ManualConnectorManager {
+                 removed_conn_urls: Arc::new(DashSet::new()),
+                 net_ns: global_ctx.net_ns.clone(),
+                 global_ctx,
++                kick: Arc::new(tokio::sync::Notify::new()),
+             }),
+             tasks,
+         };
+@@ -140,10 +143,12 @@ impl ManualConnectorManager {
+     {
+         tracing::info!("add_connector: {}", connector.remote_url());
+         self.data.connectors.insert(connector.remote_url());
++        self.data.kick.notify_one();
+     }
+ 
+     pub async fn add_connector_by_url(&self, url: url::Url) -> Result<(), Error> {
+         self.data.connectors.insert(url);
++        self.data.kick.notify_one();
+         Ok(())
+     }
+ 
+@@ -217,36 +222,66 @@ impl ManualConnectorManager {
+         let (reconn_result_send, mut reconn_result_recv) = mpsc::channel(100);
+         let tasks = Arc::new(std::sync::Mutex::new(JoinSet::new()));
+         join_joinset_background(tasks.clone(), "connector_reconnect_tasks".to_string());
++        // Trinity: a lost connection or a new connector is dialled at once,
++        // not at the next 1 s tick (which made every start and every reconnect wait up to a second).
++        let mut events = data.global_ctx.subscribe();
++        let mut events_open = true;
++        // Event-driven scans at most this often: a node that is rejected right after its handshake
++        // (e.g. a duplicate credential) must not redial in a tight loop.
++        const MIN_EVENT_SCAN_GAP: Duration = Duration::from_millis(500);
++        let mut last_event_scan = Instant::now() - MIN_EVENT_SCAN_GAP;
+ 
+         loop {
+-            tokio::select! {
+-                _ = reconn_interval.tick() => {
+-                    let dead_urls = Self::collect_dead_conns(data.clone()).await;
+-                    if dead_urls.is_empty() {
+-                        continue;
++            let scan = tokio::select! {
++                _ = reconn_interval.tick() => Some(false),
++                // A new connector: at once.
++                _ = data.kick.notified() => Some(false),
++                ev = events.recv(), if events_open => match ev {
++                    Ok(GlobalCtxEvent::PeerConnRemoved(_)) | Ok(GlobalCtxEvent::PeerRemoved(_)) => Some(true),
++                    Ok(_) => None,
++                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(true),
++                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
++                        events_open = false;
++                        None
+                     }
+-                    for dead_url in dead_urls {
+-                        let data_clone = data.clone();
+-                        let sender = reconn_result_send.clone();
+-                        data.connectors.remove(&dead_url).unwrap();
+-                        let insert_succ = data.reconnecting.insert(dead_url.clone());
+-                        assert!(insert_succ);
+-
+-                        tasks.lock().unwrap().spawn(async move {
+-                            let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone() ).await;
+-                            let _ = sender.send(reconn_ret).await;
+-
+-                            data_clone.reconnecting.remove(&dead_url).unwrap();
+-                            data_clone.connectors.insert(dead_url.clone());
+-                        });
+-                    }
+-                    tracing::info!("reconn_interval tick, done");
+-                }
+-
++                },
+                 ret = reconn_result_recv.recv() => {
+                     tracing::warn!("reconn_tasks done, reconn result: {:?}", ret);
++                    None
++                }
++            };
++            let Some(early) = scan else {
++                continue;
++            };
++            if early {
++                let since = last_event_scan.elapsed();
++                if since < MIN_EVENT_SCAN_GAP {
++                    tokio::time::sleep(MIN_EVENT_SCAN_GAP - since).await;
+                 }
++                last_event_scan = Instant::now();
++            }
++
++            let dead_urls = Self::collect_dead_conns(data.clone()).await;
++            if dead_urls.is_empty() {
++                continue;
++            }
++            for dead_url in dead_urls {
++                let data_clone = data.clone();
++                let sender = reconn_result_send.clone();
++                data.connectors.remove(&dead_url).unwrap();
++                let insert_succ = data.reconnecting.insert(dead_url.clone());
++                assert!(insert_succ);
++
++                tasks.lock().unwrap().spawn(async move {
++                    let reconn_ret = Self::conn_reconnect(data_clone.clone(), dead_url.clone()).await;
++                    let _ = sender.send(reconn_ret).await;
++
++                    data_clone.reconnecting.remove(&dead_url).unwrap();
++                    data_clone.connectors.insert(dead_url.clone());
++                    // Trinity: a failed attempt is retried on the next tick (1 s), a successful one needs nothing.
++                });
+             }
++            tracing::info!("reconn scan done");
+         }
+     }
+ 
+diff --git a/easytier/src/gateway/socks5.rs b/easytier/src/gateway/socks5.rs
+index 0cd5d07..3f38803 100644
+--- a/easytier/src/gateway/socks5.rs
++++ b/easytier/src/gateway/socks5.rs
+@@ -245,6 +245,9 @@ impl AsyncTcpConnector for Socks5KcpConnector {
+     }
+ }
+ 
++/// Trinity: how long a forwarded connection to a virtual-network address waits for its route.
++const VIRTUAL_ROUTE_WAIT: Duration = Duration::from_secs(5);
++
+ struct Socks5AutoConnector {
+     #[cfg(feature = "kcp")]
+     kcp_endpoint: Option<Weak<KcpEndpoint>>,
+@@ -281,6 +284,27 @@ impl AsyncTcpConnector for Socks5AutoConnector {
+             addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port());
+         }
+ 
++        // Trinity: an address inside our own virtual network has no route yet (start-up, a
++        // reconnect, a route that blinked): wait briefly for it instead of dialling it over the
++        // phone's own network, where it never answers and the connection hung for 10 s.
++        if self.smoltcp_net.is_some()
++            && !addr.ip().is_loopback()
++            && let IpAddr::V4(v4) = addr.ip()
++            && peer_mgr_arc
++                .get_global_ctx()
++                .get_ipv4()
++                .is_some_and(|inet| inet.network().contains(&v4))
++            && peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
++        {
++            let deadline = Instant::now() + VIRTUAL_ROUTE_WAIT;
++            while peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty() {
++                if Instant::now() >= deadline {
++                    return Err(anyhow::anyhow!("no route to {} in the virtual network", addr).into());
++                }
++                tokio::time::sleep(Duration::from_millis(25)).await;
++            }
++        }
++
+         if self.smoltcp_net.is_none()
+             || peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
+             || addr.ip().is_loopback()
+@@ -701,7 +725,11 @@ impl Socks5Server {
+                                 ));
+                             }
+                         }
+-                        Err(err) => tracing::error!("accept error = {:?}", err),
++                        Err(err) => {
++                            tracing::error!("accept error = {:?}", err);
++                            // Trinity: never spin on a failing listener (see the port forward loop).
++                            tokio::time::sleep(Duration::from_millis(200)).await;
++                        }
+                     }
+                 }
+             });
+@@ -801,9 +829,10 @@ impl Socks5Server {
+ 
+     pub async fn add_tcp_port_forward(&self, cfg: &PortForwardConfig) -> Result<(), Error> {
+         let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
+-        let listener = bind::<TcpListener>()
++        let net_ns = self.global_ctx.net_ns.clone();
++        let mut listener = bind::<TcpListener>()
+             .addr(bind_addr)
+-            .net_ns(self.global_ctx.net_ns.clone())
++            .net_ns(net_ns.clone())
+             .call()?;
+ 
+         let net = self.net.clone();
+@@ -820,6 +849,7 @@ impl Socks5Server {
+             .insert(cfg.clone(), cancel_token.clone().drop_guard());
+ 
+         self.tasks.lock().unwrap().spawn(async move {
++            let mut accept_errors: u32 = 0;
+             loop {
+                 let (incoming_socket, addr) = select! {
+                     biased;
+@@ -829,14 +859,33 @@ impl Socks5Server {
+                     }
+                     res = listener.accept() => {
+                         match res {
+-                            Ok(result) => result,
++                            Ok(result) => {
++                                accept_errors = 0;
++                                result
++                            }
+                             Err(err) => {
+-                                tracing::error!("port forward accept error = {:?}", err);
++                                // Trinity: iOS can invalidate a listening socket while the app is
++                                // suspended; accept then fails at once, forever, and this loop spun
++                                // a core. Back off, and after a few failures bind a fresh listener.
++                                accept_errors += 1;
++                                tracing::error!(accept_errors, "port forward accept error = {:?}", err);
++                                tokio::time::sleep(Duration::from_millis(50 * accept_errors.min(20) as u64)).await;
++                                if accept_errors >= 3 {
++                                    match bind::<TcpListener>().addr(bind_addr).net_ns(net_ns.clone()).call() {
++                                        Ok(fresh) => {
++                                            tracing::warn!(?bind_addr, "port forward listener rebound");
++                                            listener = fresh;
++                                            accept_errors = 0;
++                                        }
++                                        Err(e) => tracing::error!(?bind_addr, "port forward rebind failed: {:?}", e),
++                                    }
++                                }
+                                 continue;
+                             }
+                         }
+                     }
+                 };
++                let _ = incoming_socket.set_nodelay(true);
+ 
+                 tracing::info!(
+                     "port forward: accept new connection from {:?} to {:?}",
+diff --git a/easytier/src/gateway/tokio_smoltcp/reactor.rs b/easytier/src/gateway/tokio_smoltcp/reactor.rs
+index 21a735e..cad0b58 100644
+--- a/easytier/src/gateway/tokio_smoltcp/reactor.rs
++++ b/easytier/src/gateway/tokio_smoltcp/reactor.rs
+@@ -148,7 +148,10 @@ impl Reactor {
+         &self.socket_allocator
+     }
+     pub fn notify(&self) {
+-        self.notify.notify_waiters();
++        // Trinity: the reactor loop is the only waiter and it is not always parked in its select
++        // (it may be sending or polling). notify_waiters() then wakes nobody and the wake-up is
++        // lost until the next packet or timer (up to ~10 s); notify_one() stores a permit.
++        self.notify.notify_one();
+     }
+     pub fn iface(&self) -> &BufferInterface {
+         &self.iface

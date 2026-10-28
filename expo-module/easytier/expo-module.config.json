@@ -1,6 +1,7 @@
 {
   "platforms": ["apple"],
   "apple": {
-    "modules": ["EasyTierModule"]
+    "modules": ["EasyTierModule"],
+    "appDelegateSubscribers": ["EasyTierAppDelegateSubscriber"]
   }
 }

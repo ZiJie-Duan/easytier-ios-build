@@ -75,6 +75,26 @@ Secure mode is all-or-nothing: secure and non-secure nodes reject each other's h
 - **Duplicate-symbol risk:** the archive exports unprefixed C symbols from vendored **zstd** (`ZSTD_*`, `HUF_*`, `FSE_*`, `ZDICT_*`, ...) and **kcp** (`ikcp_*`). If another library in the app also links zstd or kcp statically, the link fails with duplicate symbols, or one copy silently wins. `ring` symbols are version-prefixed (`ring_core_0_17_14_*`) and are safe. The archive also exports `_rust_eh_personality`, which clashes if the app links a second Rust staticlib. In that case, build both into a single staticlib.
 - Never call `free()` on strings the library returns. Call `free_string()` instead.
 
+### Source patch: fast path (`patches/fast-path.patch`, since v2.6.4-4)
+
+For an app that restarts its node often (phone: suspended, network changes) and reaches services through `port_forward`:
+
+- **Dial at once.** The manual connector only dialled on its 1 s tick: a new peer waited up to a second, a lost connection up to a second more. It now also scans when a connector is added and when a connection closes (event-driven scans at most every 500 ms, so a node rejected right after its handshake does not redial in a loop).
+- **No direct dial into our own virtual network.** A forwarded connection to an address in the node's own subnet that has no route yet (start-up, restart) was dialled over the host network, where it never answers, and hung 10 s. It now waits for the route (≤ 5 s, polled every 25 ms) and fails fast after that.
+- **smoltcp reactor lost wake-up.** `Reactor::notify` used `notify_waiters()`, which wakes nobody when the reactor loop is not parked in its `select!` (sending, polling): the wake-up was lost until the next packet or timer. `notify_one()` stores a permit; the loop is the only waiter.
+- **Accept loops never spin.** iOS can invalidate a suspended app's listening sockets; `accept` then fails at once, forever, and the port-forward loop spun a core. It now backs off and rebinds the listener after 3 failures; the SOCKS5 portal loop backs off too. Accepted local sockets get `TCP_NODELAY`.
+
+Measured on Linux (Docker, the FFI driven through Python ctypes the way the iOS app calls it, an unpatched v2.6.4 hub in secure mode with a non-reusable credential; LAN round trip ≈ 0):
+
+| | v2.6.4-3 | v2.6.4-4 |
+|---|---|---|
+| start → first HTTP response through the forward | 0.20 s | 0.03–0.11 s |
+| first request while the forward listens but has no route yet | 0.09–1.16 s | 0.03 s |
+| restart after the link died silently (network change) | 0.20 s | 0.11 s |
+| link silently dead, no restart (until EasyTier notices) | 13.8 s | — |
+
+Tried and dropped: reconnecting with the same peer id (closing the connections and redialling) and a fixed `peer_id` across restarts were *slower* (2–9 s): the hub keeps sending to the old, silently dead connection of that peer id until it re-picks the peer's connection (every 5 s). A restart with a new random id is the fastest way back.
+
 ## Simulator smoke test
 
 Workflow [`smoke-ios-sim`](.github/workflows/smoke-ios-sim.yml) (manual, or on push to `main` touching `smoke/**`) checks the published release zip on a real iOS Simulator. It uses the zip as an app would. No Mac is needed.
